@@ -20,6 +20,7 @@ SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET", "Operations")
 TZ = os.getenv("TIMEZONE", "Europe/Moscow")
 
+# Пример: "123456789,987654321"
 ALLOWED_USER_IDS_RAW = os.getenv("ALLOWED_USER_IDS", "")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
 
@@ -67,23 +68,52 @@ dp = Dispatcher()
 
 TAGS = {"#расход": "расход", "#приход": "приход"}
 
+# Сумма: optional +/- затем цифры с разделителями пробел . , _
+# Примеры: 3650 | 3 650 | 3.650 | 3,650 | -3 650 | +3_650
+AMOUNT_RE = re.compile(r"(?P<num>[+-]?\d[\d\s\.,_]*\d|[+-]?\d)")
+
 
 def now():
     return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse(text):
+def parse_amount(rest: str):
+    """
+    Возвращает (amount:int|None, comment:str)
+    amount — число без разделителей.
+    comment — текст без найденной суммы.
+    """
+    m = AMOUNT_RE.search(rest)
+    if not m:
+        return None, rest.strip()
+
+    raw = m.group("num").strip()
+    sign = -1 if raw.startswith("-") else 1
+
+    digits = re.sub(r"\D", "", raw)  # убираем пробелы/точки/запятые/подчерк
+    if not digits:
+        return None, rest.strip()
+
+    value = int(digits) * sign
+
+    # вырезаем сумму из комментария ровно тем куском, что нашли
+    comment = (rest[:m.start()] + rest[m.end():]).strip()
+    # подчистим лишние двойные пробелы
+    comment = re.sub(r"\s{2,}", " ", comment)
+    return value, comment
+
+
+def parse(text: str):
+    text = text.strip()
+    if not text:
+        return None, None, ""
+
     first = text.split()[0].lower()
     if first not in TAGS:
         return None, None, ""
 
     rest = text[len(first):].strip()
-    m = re.search(r"\d+", rest)
-    if not m:
-        return None, None, rest
-
-    amount = int(m.group())
-    comment = rest.replace(m.group(), "").strip()
+    amount, comment = parse_amount(rest)
     return TAGS[first], amount, comment
 
 
@@ -92,16 +122,21 @@ async def handler(message: Message):
     if message.from_user.id not in ALLOWED_USER_IDS:
         return
 
-    text = message.text.strip()
-    op_type, amount, comment = parse(text)
+    op_type, amount, comment = parse(message.text)
     if not op_type:
         return
-    # приводим знак суммы
-    if amount is not None:
-        if op_type == "expense":
-            amount = -abs(amount)
-        elif op_type == "income":
-            amount = abs(amount)
+
+    if amount is None:
+        await message.reply("Не нашёл сумму. Пример: <code>#расход 3 650 такси</code>")
+        return
+
+    # Приводим знак суммы:
+    # - расход всегда минус
+    # - приход всегда плюс
+    if op_type == "расход":
+        amount = -abs(amount)
+    elif op_type == "приход":
+        amount = abs(amount)
 
     if not message.reply_to_message:
         await message.reply("Ответь реплаем на заявку")
@@ -124,17 +159,16 @@ async def handler(message: Message):
         (chat_id, req_id, op_type)
     )
     db.commit()
-    
-    signed_amount = -amount if op_type == "expense" else amount
+
     ws.append_row([
         now(),
         message.chat.title,
-        op_type,
-        signed_amount,
+        op_type,          # "расход" / "приход"
+        amount,           # уже со знаком
         comment,
         message.from_user.full_name,
-        req.from_user.full_name,
-        req.text,
+        req.from_user.full_name if req.from_user else "",
+        req.text or "",
         chat_id,
         req_id,
         message.message_id,

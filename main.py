@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -61,7 +62,7 @@ db.commit()
 
 
 # --------- Telegram ----------
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 TAGS = {"#расход": "expense", "#приход": "income"}

@@ -96,6 +96,12 @@ async def handler(message: Message):
     op_type, amount, comment = parse(text)
     if not op_type:
         return
+    # приводим знак суммы
+    if amount is not None:
+        if op_type == "expense":
+            amount = -abs(amount)
+        elif op_type == "income":
+            amount = abs(amount)
 
     if not message.reply_to_message:
         await message.reply("Ответь реплаем на заявку")

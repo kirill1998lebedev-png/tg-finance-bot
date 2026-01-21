@@ -65,7 +65,7 @@ db.commit()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-TAGS = {"#расход": "expense", "#приход": "income"}
+TAGS = {"#расход": "расход", "#приход": "приход"}
 
 
 def now():
@@ -118,12 +118,13 @@ async def handler(message: Message):
         (chat_id, req_id, op_type)
     )
     db.commit()
-
+    
+    signed_amount = -amount if op_type == "expense" else amount
     ws.append_row([
         now(),
         message.chat.title,
         op_type,
-        amount,
+        signed_amount,
         comment,
         message.from_user.full_name,
         req.from_user.full_name,

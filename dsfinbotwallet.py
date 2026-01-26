@@ -1,6 +1,5 @@
 import os
 import re
-import sqlite3
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -14,16 +13,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# --------- ENV ----------
+# ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET", "Operations")
+WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET", "WALLET_AG")
 TZ = os.getenv("TIMEZONE", "Europe/Moscow")
 
-# wallet | chat
-BOT_MODE = os.getenv("BOT_MODE", "wallet").strip().lower()
-
-# Пример: "123456789,987654321"
 ALLOWED_USER_IDS_RAW = os.getenv("ALLOWED_USER_IDS", "")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
 
@@ -34,174 +29,126 @@ if not SHEET_ID:
 if not GOOGLE_CREDS_JSON:
     raise RuntimeError("GOOGLE_CREDS_JSON не задан")
 
-ALLOWED_USER_IDS = set()
-for part in [p.strip() for p in ALLOWED_USER_IDS_RAW.split(",") if p.strip()]:
-    ALLOWED_USER_IDS.add(int(part))
+ALLOWED_USER_IDS = {
+    int(x.strip()) for x in ALLOWED_USER_IDS_RAW.split(",") if x.strip()
+}
 
 
-# --------- Google Sheets ----------
+# ================= Google Sheets =================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-creds_dict = json.loads(GOOGLE_CREDS_JSON)
-creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+creds = Credentials.from_service_account_info(
+    json.loads(GOOGLE_CREDS_JSON), scopes=SCOPES
+)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SHEET_ID)
-ws = sh.worksheet(WORKSHEET_NAME)
+
+try:
+    ws = sh.worksheet(WORKSHEET_NAME)
+except gspread.WorksheetNotFound:
+    ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=20)
+
+HEADERS = [
+    "timestamp",
+    "chat",
+    "type",
+    "amount",
+    "comment",
+    "from",
+    "chat_id",
+    "message_id",
+]
+
+if not ws.row_values(1):
+    ws.update("A1:H1", [HEADERS])
 
 
-# --------- Anti-duplicate ----------
-db = sqlite3.connect("dedupe.db")
-db.execute("""
-CREATE TABLE IF NOT EXISTS processed (
-    chat_id INTEGER,
-    request_msg_id INTEGER,
-    op_type TEXT,
-    PRIMARY KEY (chat_id, request_msg_id, op_type)
-)
-""")
-db.commit()
-
-
-# --------- Telegram ----------
+# ================= Telegram =================
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 TAGS = {"#расход": "расход", "#приход": "приход"}
 
-# Сумма: optional +/- затем цифры с разделителями пробел . , _
-# Примеры: 3650 | 3 650 | 3.650 | 3,650 | -3 650 | +3_650
-AMOUNT_RE = re.compile(r"(?P<num>[+-]?\d[\d\s\.,_]*\d|[+-]?\d)")
+AMOUNT_RE = re.compile(r"(?P<num>[+-]?\d[\d\s\.,_]*)")
 
 
 def now():
     return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_amount(rest: str):
+def parse_line(line: str):
+    line = line.strip()
+    if not line:
+        return None
+
+    first = line.split()[0].lower()
+    if first not in TAGS:
+        return None
+
+    rest = line[len(first):].strip()
     m = AMOUNT_RE.search(rest)
     if not m:
-        return None, rest.strip()
+        return None
 
-    raw = m.group("num").strip()
+    raw = m.group("num")
     sign = -1 if raw.startswith("-") else 1
-
     digits = re.sub(r"\D", "", raw)
-    if not digits:
-        return None, rest.strip()
 
-    value = int(digits) * sign
+    if not digits:
+        return None
+
+    amount = int(digits) * sign
+
+    if TAGS[first] == "расход":
+        amount = -abs(amount)
+    else:
+        amount = abs(amount)
 
     comment = (rest[:m.start()] + rest[m.end():]).strip()
-    comment = re.sub(r"\s{2,}", " ", comment)
-    return value, comment
-
-
-def parse(text: str):
-    text = (text or "").strip()
-    if not text:
-        return None, None, ""
-
-    first = text.split()[0].lower()
-    if first not in TAGS:
-        return None, None, ""
-
-    rest = text[len(first):].strip()
-    amount, comment = parse_amount(rest)
     return TAGS[first], amount, comment
 
 
-def sign_amount(op_type: str, amount: int) -> int:
-    # - расход всегда минус
-    # - приход всегда плюс
-    if op_type == "расход":
-        return -abs(amount)
-    if op_type == "приход":
-        return abs(amount)
-    return amount
-
-
-def dedupe_key(message: Message, op_type: str):
-    """
-    В chat-режиме ключ — id сообщения-заявки (reply_to_message.message_id)
-    В wallet-режиме ключ — само сообщение пользователя (message.message_id)
-    """
-    chat_id = message.chat.id
-    if BOT_MODE == "chat":
-        req = message.reply_to_message
-        if not req:
-            return None
-        return (chat_id, req.message_id, op_type)
-    else:
-        return (chat_id, message.message_id, op_type)
+def append_row(row):
+    ws.append_row(
+        row,
+        table_range="A1",
+        insert_data_option="INSERT_ROWS",
+        value_input_option="USER_ENTERED",
+    )
 
 
 @dp.message(F.text)
 async def handler(message: Message):
-    # доступ
-    if ALLOWED_USER_IDS and (message.from_user.id not in ALLOWED_USER_IDS):
+    if ALLOWED_USER_IDS and message.from_user.id not in ALLOWED_USER_IDS:
         return
 
-    op_type, amount, comment = parse(message.text)
-    if not op_type:
-        return
+    lines = message.text.splitlines()
+    added = 0
 
-    if amount is None:
-        await message.reply("Не нашёл сумму. Пример: <code>#расход 3 650 такси</code>")
-        return
+    for line in lines:
+        parsed = parse_line(line)
+        if not parsed:
+            continue
 
-    amount = sign_amount(op_type, amount)
+        op_type, amount, comment = parsed
 
-    # chat mode: требуем реплай на заявку
-    if BOT_MODE == "chat" and not message.reply_to_message:
-        await message.reply("Ответь реплаем на заявку")
-        return
+        append_row([
+            now(),
+            message.chat.title or "private",
+            op_type,
+            amount,
+            comment,
+            message.from_user.full_name,
+            message.chat.id,
+            message.message_id,
+        ])
+        added += 1
 
-    key = dedupe_key(message, op_type)
-    if not key:
-        await message.reply("Ответь реплаем на заявку")
-        return
-
-    chat_id, req_id, op_type_key = key
-
-    cur = db.execute(
-        "SELECT 1 FROM processed WHERE chat_id=? AND request_msg_id=? AND op_type=?",
-        (chat_id, req_id, op_type_key)
-    )
-    if cur.fetchone():
-        await message.reply("Уже записано")
-        return
-
-    db.execute("INSERT INTO processed VALUES (?,?,?)", (chat_id, req_id, op_type_key))
-    db.commit()
-
-    # поля для таблицы
-    if BOT_MODE == "chat":
-        req = message.reply_to_message
-        req_from = req.from_user.full_name if req and req.from_user else ""
-        req_text = req.text or ""
-    else:
-        req_from = ""
-        req_text = ""
-
-    ws.append_row([
-        now(),
-        message.chat.title or "private",
-        op_type,          # "расход" / "приход"
-        amount,           # со знаком
-        comment,
-        message.from_user.full_name,
-        req_from,
-        req_text,
-        message.chat.id,
-        req_id,
-        message.message_id,
-        BOT_MODE
-    ])
-
-    await message.reply("Записал ✅")
+    if added:
+        await message.reply(f"Записал строк: {added} ✅")
 
 
 async def main():

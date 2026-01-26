@@ -1,5 +1,5 @@
 parts = message.text.strip().split(maxsplit=2)
-    if len(parts) < 3:
+if len(parts) < 3:
         await message.answer("Формат: /edit ID сумма комментарий")
         return
 

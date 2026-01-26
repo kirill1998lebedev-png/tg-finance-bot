@@ -64,7 +64,8 @@ keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="➕ Приход"), KeyboardButton(text="➖ Расход")],
         [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🕘 Последние")],
-        [KeyboardButton(text="✏️ Редактировать"), KeyboardButton(text="ℹ️ Справка")],
+        [KeyboardButton(text="✏️ Редактировать"), KeyboardButton(text="🗑 Удалить")],
+        [KeyboardButton(text="ℹ️ Справка")],
     ],
     resize_keyboard=True,
 )
@@ -76,6 +77,7 @@ class WalletState(StatesGroup):
     add_expense = State()
     edit_select = State()
     edit_value = State()
+    delete_select = State()   
 
 
 # ========= HELP =========
@@ -239,6 +241,24 @@ async def edit_value(m: Message, state: FSMContext):
 
     await state.clear()
     await m.answer("✏️ Обновлено", reply_markup=keyboard)
+    
+    
+@dp.message(WalletState.delete_select)
+async def delete_row(m: Message, state: FSMContext):
+    try:
+        row = int(m.text)
+    except ValueError:
+        return await m.answer("Нужно число — ID строки")
+
+    # очищаем данные, но строку НЕ удаляем
+    ws.update(
+        f"A{row}:F{row}",
+        [["", "", "", "", "", ""]],
+        value_input_option="USER_ENTERED",
+    )
+
+    await state.clear()
+    await m.answer("🗑 Запись удалена", reply_markup=keyboard)
 
 
 # ========= RUN =========

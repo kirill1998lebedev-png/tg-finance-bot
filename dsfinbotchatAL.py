@@ -15,14 +15,20 @@ from google.oauth2.service_account import Credentials
 
 
 # --------- ENV ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET", "Operations")
-TZ = os.getenv("TIMEZONE", "Europe/Moscow")
+PREFIX = os.getenv("BOT_PREFIX", "").strip()
 
-# Пример: "123456789,987654321"
-ALLOWED_USER_IDS_RAW = os.getenv("ALLOWED_USER_IDS", "")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
+def env(name: str, default=None):
+    # если PREFIX задан → читаем PREFIX_NAME, иначе → NAME
+    return os.getenv(f"{PREFIX}_{name}", os.getenv(name, default))
+
+BOT_TOKEN = env("BOT_TOKEN")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # общий, без префикса
+WORKSHEET_NAME = env("GOOGLE_WORKSHEET", "Operations")
+TZ = os.getenv("TIMEZONE", "Europe/Moscow")  # общий, без префикса
+
+ALLOWED_USER_IDS_RAW = env("ALLOWED_USER_IDS", "")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")  # общий, без префикса
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан")

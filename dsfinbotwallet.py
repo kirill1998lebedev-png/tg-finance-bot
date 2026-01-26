@@ -134,7 +134,60 @@ async def undo(m: Message):
 
     ws.delete_rows(len(rows))
     await m.answer("❌ Последняя операция удалена")
+@dp.message(F.text.startswith("/edit"))
+async def edit(m: Message):
+    if m.from_user.id not in ALLOWED_USER_IDS:
+        return
 
+    parts = m.text.split(maxsplit=3)
+    if len(parts) < 3:
+        await m.answer(
+            "Формат:\n"
+            "<code>/edit НОМЕР НОВАЯ_СУММА комментарий</code>\n\n"
+            "Пример:\n"
+            "<code>/edit 1 1500 такси ночное</code>"
+        )
+        return
+
+    try:
+        index = int(parts[1])
+    except ValueError:
+        await m.answer("Номер операции должен быть числом")
+        return
+
+    rest = parts[2:]
+    text = " ".join(rest)
+
+    m_amount = AMOUNT_RE.search(text)
+    if not m_amount:
+        await m.answer("Не нашёл сумму")
+        return
+
+    raw = m_amount.group()
+    new_amount = int(re.sub(r"\D", "", raw))
+    new_comment = text.replace(raw, "").strip()
+
+    rows = ws.get_all_values()
+    data_rows = rows[1:]  # без заголовков
+
+    if index < 1 or index > len(data_rows):
+        await m.answer("Такой операции нет")
+        return
+
+    # Берём строку с конца (как /last)
+    row_number = len(rows) - (len(data_rows) - index)
+
+    op_type = rows[row_number - 1][1]  # приход / расход
+
+    if op_type == "расход":
+        new_amount = -abs(new_amount)
+    else:
+        new_amount = abs(new_amount)
+
+    ws.update(f"C{row_number}", new_amount)   # amount
+    ws.update(f"D{row_number}", new_comment)  # comment
+
+    await m.answer("✏️ Операция обновлена")
 # ========= HANDLER =========
 @dp.message(F.text)
 async def handler(m: Message):

@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import gspread
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,202 +8,203 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
 
+import gspread
 from google.oauth2.service_account import Credentials
+
 
 # ========= ENV =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET", "WALLET_AG")
-ALLOWED_USER_IDS = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()}
+WORKSHEET = os.getenv("GOOGLE_WORKSHEET")
 TZ = os.getenv("TIMEZONE", "Europe/Moscow")
-CREDS = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
+ALLOWED_USER_IDS = {
+    int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()
+}
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+
+if not all([BOT_TOKEN, SHEET_ID, WORKSHEET, GOOGLE_CREDS_JSON]):
+    raise RuntimeError("Не заданы переменные окружения")
+
 
 # ========= GOOGLE =========
 creds = Credentials.from_service_account_info(
-    CREDS,
+    json.loads(GOOGLE_CREDS_JSON),
     scopes=[
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ],
 )
 gc = gspread.authorize(creds)
-sh = gc.open_by_key(SHEET_ID)
+ws = gc.open_by_key(SHEET_ID).worksheet(WORKSHEET)
 
-try:
-    ws = sh.worksheet(WORKSHEET_NAME)
-except:
-    ws = sh.add_worksheet(WORKSHEET_NAME, rows=1000, cols=10)
-
-HEADERS = ["timestamp", "type", "amount", "category", "comment", "from"]
-if not ws.row_values(1):
-    ws.update("A1:F1", [HEADERS])
 
 # ========= BOT =========
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="➕ Приход"), KeyboardButton(text="➖ Расход")],
-        [KeyboardButton(text="📊 Баланс"), KeyboardButton(text="🕘 Последние")],
-        [KeyboardButton(text="✏️ Редактировать"), KeyboardButton(text="❌ Удалить")],
-        [KeyboardButton(text="ℹ️ Справка")],
-    ],
-    resize_keyboard=True,
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
+dp = Dispatcher(storage=MemoryStorage())
 
-AMOUNT_RE = re.compile(r"[+-]?\d[\d\s.,_]*")
-CAT_RE = re.compile(r"#([^\s#]+)")
+
+# ========= REGEX =========
+AMOUNT_RE = re.compile(r"[+-]?\d[\d\s\.,]*")
+CAT_RE = re.compile(r"#(\w+)")
+
 
 def now():
     return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
 
+
+# ========= KEYBOARD =========
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Приход"), KeyboardButton(text="➖ Расход")],
+        [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🕘 Последние")],
+        [KeyboardButton(text="✏️ Редактировать"), KeyboardButton(text="ℹ️ Справка")],
+    ],
+    resize_keyboard=True,
+)
+
+
 # ========= FSM =========
 class WalletState(StatesGroup):
-    add_value = State()
+    add_income = State()
+    add_expense = State()
     edit_select = State()
     edit_value = State()
 
-# ========= HELP =========
-HELP_TEXT = (
-    "ℹ️ <b>Справка</b>\n\n"
-    "➕ Приход / ➖ Расход\n"
-    "После кнопки пиши сумму и комментарий.\n"
-    "Можно несколько строк.\n\n"
-    "Категория (необязательно): <code>#категория</code>\n"
-    "Пример:\n"
-    "<code>1200 #такси до дома</code>\n\n"
-    "📊 Баланс — текущий баланс\n"
-    "🕘 Последние — последние 5 операций\n"
-    "✏️ Редактировать — изменить любую операцию\n"
-    "❌ Удалить — удалить последнюю"
-)
 
-# ========= COMMANDS =========
+# ========= HELP =========
+@dp.message(F.text == "ℹ️ Справка")
+async def help_msg(m: Message):
+    await m.answer(
+        "📌 <b>Как пользоваться</b>\n\n"
+        "➕ Приход / ➖ Расход — ввод сумм\n"
+        "Можно несколько строк:\n"
+        "<code>1500 кофе\n3200 #еда обед</code>\n\n"
+        "#категория — необязательна\n\n"
+        "🕘 Последние — с ID строк\n"
+        "✏️ Редактировать — по ID\n"
+        "💰 Баланс — общий",
+        reply_markup=keyboard,
+    )
+
+
+# ========= START =========
 @dp.message(F.text == "/start")
 async def start(m: Message):
-    await m.answer("💼 Wallet-бот готов к работе", reply_markup=keyboard)
-    await m.answer(HELP_TEXT)
-
-@dp.message(F.text == "ℹ️ Справка")
-async def help_cmd(m: Message):
-    await m.answer(HELP_TEXT, reply_markup=keyboard)
-
-@dp.message(F.text == "📊 Баланс")
-async def balance(m: Message):
-    vals = ws.col_values(3)[1:]
-    total = sum(int(v) for v in vals if v)
-    await m.answer(f"📊 Баланс: <b>{total} ₽</b>")
-
-@dp.message(F.text == "🕘 Последние")
-async def last(m: Message):
-    rows = ws.get_all_values()[1:][-5:]
-    if not rows:
-        await m.answer("Нет операций")
+    if m.from_user.id not in ALLOWED_USER_IDS:
         return
+    await m.answer("💼 Кошелёк готов", reply_markup=keyboard)
 
-    text = "🕘 Последние операции:\n\n"
-    for i, r in enumerate(rows, 1):
-        cat = f"#{r[3]} " if r[3] else ""
-        text += f"{i}️⃣ {r[1]} | {r[2]} ₽ | {cat}{r[4]}\n"
-    await m.answer(text)
-
-@dp.message(F.text == "❌ Удалить")
-async def delete_last(m: Message):
-    rows = ws.get_all_values()
-    if len(rows) <= 1:
-        await m.answer("Нечего удалять")
-        return
-    ws.delete_rows(len(rows))
-    await m.answer("❌ Последняя операция удалена")
 
 # ========= ADD =========
-@dp.message(F.text.in_(["➕ Приход", "➖ Расход"]))
-async def choose_type(m: Message, state: FSMContext):
-    op = "приход" if "Приход" in m.text else "расход"
-    await state.update_data(op=op)
-    await state.set_state(WalletState.add_value)
-    await m.answer("Введи сумму и комментарий (можно несколько строк)")
-
-def parse_multi_lines(text: str, op: str):
-    results = []
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
+async def process_lines(m: Message, sign: int):
+    lines = [l.strip() for l in m.text.splitlines() if l.strip()]
+    for line in lines:
         m_amount = AMOUNT_RE.search(line)
         if not m_amount:
             continue
 
         raw = m_amount.group()
-        amount = int(re.sub(r"\D", "", raw))
-        amount = -abs(amount) if op == "расход" else abs(amount)
+        amount = int(re.sub(r"\D", "", raw)) * sign
 
-        cat_match = CAT_RE.search(line)
-        category = cat_match.group(1) if cat_match else ""
+        cat = ""
+        m_cat = CAT_RE.search(line)
+        if m_cat:
+            cat = m_cat.group(1)
 
-        cleaned = line.replace(raw, "")
-        if cat_match:
-            cleaned = cleaned.replace(cat_match.group(0), "")
-        comment = cleaned.strip()
+        comment = line.replace(raw, "")
+        if m_cat:
+            comment = comment.replace(m_cat.group(0), "")
+        comment = comment.strip()
 
-        results.append((amount, category, comment))
+        ws.append_row([
+            now(),
+            "приход" if sign > 0 else "расход",
+            amount,
+            cat,
+            comment,
+            m.from_user.full_name,
+        ])
 
-    return results
+    await m.answer("✅ Записал", reply_markup=keyboard)
 
-@dp.message(WalletState.add_value)
-async def add_value(m: Message, state: FSMContext):
-    if m.from_user.id not in ALLOWED_USER_IDS:
-        return
 
-    data = await state.get_data()
-    op = data["op"]
+@dp.message(F.text == "➕ Приход")
+async def income(m: Message, state: FSMContext):
+    await state.set_state(WalletState.add_income)
+    await m.answer("Введи сумму и комментарий")
 
-    rows = parse_multi_lines(m.text, op)
-    if not rows:
-        await m.answer("Не нашёл ни одной корректной строки")
-        return
 
-    for amount, category, comment in rows:
-        ws.append_row(
-            [now(), op, amount, category, comment, m.from_user.full_name],
-            table_range="A1",
-            insert_data_option="INSERT_ROWS",
-            value_input_option="USER_ENTERED",
-        )
+@dp.message(F.text == "➖ Расход")
+async def expense(m: Message, state: FSMContext):
+    await state.set_state(WalletState.add_expense)
+    await m.answer("Введи сумму и комментарий")
 
+
+@dp.message(WalletState.add_income)
+async def income_add(m: Message, state: FSMContext):
+    await process_lines(m, +1)
     await state.clear()
-    await m.answer(f"✅ Записано строк: {len(rows)}", reply_markup=keyboard)
+
+
+@dp.message(WalletState.add_expense)
+async def expense_add(m: Message, state: FSMContext):
+    await process_lines(m, -1)
+    await state.clear()
+
+
+# ========= BALANCE =========
+@dp.message(F.text == "💰 Баланс")
+async def balance(m: Message):
+    rows = ws.get_all_values()[1:]
+    total = sum(int(r[2]) for r in rows if len(r) > 2 and r[2])
+    await m.answer(f"💰 Баланс: <b>{total} ₽</b>")
+
+
+# ========= LAST =========
+@dp.message(F.text == "🕘 Последние")
+async def last(m: Message):
+    rows = ws.get_all_values()
+    data = rows[1:]
+    if not data:
+        await m.answer("Нет операций")
+        return
+
+    last_rows = data[-10:]
+    start = len(data) - len(last_rows) + 2
+
+    text = "🕘 Последние операции:\n\n"
+    for i, r in enumerate(last_rows):
+        rid = start + i
+        text += f"ID <b>{rid}</b> — {r[1]} {r[2]} ₽ {r[4]}\n"
+
+    await m.answer(text)
+
 
 # ========= EDIT =========
 @dp.message(F.text == "✏️ Редактировать")
-async def edit_choose(m: Message, state: FSMContext):
+async def edit(m: Message, state: FSMContext):
     await state.set_state(WalletState.edit_select)
-    await m.answer("Введи номер операции из списка «Последние»")
+    await m.answer("Введи ID строки")
+
 
 @dp.message(WalletState.edit_select)
 async def edit_select(m: Message, state: FSMContext):
     try:
-        idx = int(m.text)
+        row = int(m.text)
     except:
-        await m.answer("Нужно число")
-        return
+        return await m.answer("Нужно число")
 
-    rows = ws.get_all_values()
-    data = rows[1:]
-    if idx < 1 or idx > len(data):
-        await m.answer("Такой операции нет")
-        return
-
-    row_num = len(rows) - (len(data) - idx)
-    await state.update_data(row=row_num)
+    await state.update_data(row=row)
     await state.set_state(WalletState.edit_value)
-    await m.answer("Введи новую сумму и комментарий")
+    await m.answer("Введи новое значение")
+
 
 @dp.message(WalletState.edit_value)
 async def edit_value(m: Message, state: FSMContext):
@@ -213,32 +213,38 @@ async def edit_value(m: Message, state: FSMContext):
 
     m_amount = AMOUNT_RE.search(m.text)
     if not m_amount:
-        await m.answer("Не нашёл сумму")
-        return
+        return await m.answer("Не нашёл сумму")
 
     raw = m_amount.group()
     amount = int(re.sub(r"\D", "", raw))
+
     op = ws.cell(row, 2).value
     amount = -abs(amount) if op == "расход" else abs(amount)
 
-    cat_match = CAT_RE.search(m.text)
-    category = cat_match.group(1) if cat_match else ""
+    cat = ""
+    m_cat = CAT_RE.search(m.text)
+    if m_cat:
+        cat = m_cat.group(1)
 
-    cleaned = m.text.replace(raw, "")
-    if cat_match:
-        cleaned = cleaned.replace(cat_match.group(0), "")
-    comment = cleaned.strip()
+    comment = m.text.replace(raw, "")
+    if m_cat:
+        comment = comment.replace(m_cat.group(0), "")
+    comment = comment.strip()
 
-    ws.update(f"C{row}", amount)
-    ws.update(f"D{row}", category)
-    ws.update(f"E{row}", comment)
+    ws.update(
+        f"C{row}:E{row}",
+        [[amount, cat, comment]],
+        value_input_option="USER_ENTERED",
+    )
 
     await state.clear()
-    await m.answer("✏️ Операция обновлена", reply_markup=keyboard)
+    await m.answer("✏️ Обновлено", reply_markup=keyboard)
 
-# ========= START =========
+
+# ========= RUN =========
 async def main():
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     import asyncio
